@@ -16,25 +16,35 @@ import urllib.request
 import urllib.error
 import datetime as dt
 
-# ---- What to watch (from the booking URL the user provided) ----
-ESTABLISHMENT = os.environ.get("CS_ESTABLISHMENT", "8154")
-PLACE         = os.environ.get("CS_PLACE", "23139")
-SERVICES      = os.environ.get("CS_SERVICES", "11,289,336,354")
-TIMEZONE      = os.environ.get("CS_TIMEZONE", "America/Toronto")
-LOOKAHEAD_DAYS = int(os.environ.get("CS_LOOKAHEAD_DAYS", "90"))
+def env(name, default=""):
+    """Read an env var, treating unset OR empty-string as "use default".
 
-BOOKING_URL = os.environ.get(
+    GitHub Actions expands ${{ vars.X }} to "" when the variable doesn't exist,
+    so we must not let an empty string override the baked-in defaults.
+    """
+    value = os.environ.get(name)
+    return value if value not in (None, "") else default
+
+
+# ---- What to watch (from the booking URL the user provided) ----
+ESTABLISHMENT = env("CS_ESTABLISHMENT", "8154")
+PLACE         = env("CS_PLACE", "23139")
+SERVICES      = env("CS_SERVICES", "11,289,336,354")
+TIMEZONE      = env("CS_TIMEZONE", "America/Toronto")
+LOOKAHEAD_DAYS = int(env("CS_LOOKAHEAD_DAYS", "90"))
+
+BOOKING_URL = env(
     "CS_BOOKING_URL",
     "https://clients3.clicsante.ca/8154/take-appt?portalPlace=23139&portalPostalCode=null"
     "&lang=fr&portalServicesUnified=11,289,336,354&portalEst=408574&locale=fr",
 )
 
 # ---- Notification (ntfy) ----
-NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "")          # required to actually send
-NTFY_TOKEN  = os.environ.get("NTFY_TOKEN", "")          # optional (for protected topics)
+NTFY_SERVER = env("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+NTFY_TOPIC  = env("NTFY_TOPIC", "")          # required to actually send
+NTFY_TOKEN  = env("NTFY_TOKEN", "")          # optional (for protected topics)
 
-STATE_FILE = os.environ.get("CS_STATE_FILE", "state.json")
+STATE_FILE = env("CS_STATE_FILE", "state.json")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
 
