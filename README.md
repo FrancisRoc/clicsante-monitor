@@ -15,15 +15,19 @@ Establishment `8154`, place `23139`, services `11,289,336,354` — i.e. this URL
 https://clients3.clicsante.ca/8154/take-appt?portalPlace=23139&lang=fr&portalServicesUnified=11,289,336,354&portalEst=408574&locale=fr
 ```
 
-It calls the public availabilities API:
+It replicates exactly what the booking page's calendar does:
 
-```
-GET https://api3.clicsante.ca/v3/establishments/8154/availabilities?dateStart=<today>&dateStop=<+90d>&places=23139&services=11,289,336,354&resources=&timezone=America/Toronto
-```
+1. Resolve the URL's unified service ids (`11,289,336,354`) to this
+   establishment's real service ids: `GET /v3/establishments/8154/unified/{id}/service`.
+2. For the place and each resolved service, read the day schedule:
+   `GET /v3/establishments/8154/schedules/day?dateStart=<today>&dateStop=<+90d>&service=<id>&places=23139&timezone=America/Toronto&gapMode=false`
+   (an empty day returns HTTP 404 `nothing-for-day`, treated as "no slots").
 
-When the response goes from empty to non-empty (or new slots appear), it pushes
-a notification. State is stored in `state.json` so you only get pinged for
-**new** slots, never repeats.
+Slots are deduplicated by id (service variants share slots), so you're pinged
+once per genuinely new slot. State is stored in `state.json`.
+
+> We deliberately do NOT use `/establishments/{id}/availabilities` — it requires
+> a resource list and silently returns `[]` without one (it would never fire).
 
 ## Get notifications on your phone
 
