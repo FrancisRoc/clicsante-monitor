@@ -15,19 +15,29 @@ Establishment `8154`, place `23139`, services `11,289,336,354` — i.e. this URL
 https://clients3.clicsante.ca/8154/take-appt?portalPlace=23139&lang=fr&portalServicesUnified=11,289,336,354&portalEst=408574&locale=fr
 ```
 
-It replicates exactly what the booking page's calendar does:
+It reads from the **same endpoint the booking page's calendar uses**, so the
+monitor sees exactly what you'd see on the page:
 
 1. Resolve the URL's unified service ids (`11,289,336,354`) to this
    establishment's real service ids: `GET /v3/establishments/8154/unified/{id}/service`.
-2. For the place and each resolved service, read the day schedule:
-   `GET /v3/establishments/8154/schedules/day?dateStart=<today>&dateStop=<+90d>&service=<id>&places=23139&timezone=America/Toronto&gapMode=false`
-   (an empty day returns HTTP 404 `nothing-for-day`, treated as "no slots").
+2. For the place and each resolved service, read the public calendar:
+   `GET /v3/establishments/8154/schedules/public?dateStart=<today>&dateStop=<+90d>&service=<id>&places=23139&timezone=America/Toronto`
+   It returns two lists per service:
+   - `availabilities` — days that are **open and bookable** (clickable on the calendar)
+   - `daysComplete` — days that exist but are **full** (greyed out)
 
-Slots are deduplicated by id (service variants share slots), so you're pinged
-once per genuinely new slot. State is stored in `state.json`.
+We alert **only on `availabilities`**, so "the monitor found a slot" means "the
+page would let you book that day". Days are deduplicated by `(place, date)`, so
+you're pinged once per genuinely new open day (the push enriches it with a few
+clock times, best-effort, via `schedules/day`). State is stored in `state.json`.
 
-> We deliberately do NOT use `/establishments/{id}/availabilities` — it requires
-> a resource list and silently returns `[]` without one (it would never fire).
+> Verified against a live clinic: the page's 2 screening questions are a UI gate
+> only — they do **not** change which days `schedules/public` returns, so the
+> monitor doesn't need them.
+>
+> We deliberately do NOT use `/establishments/{id}/availabilities` (needs a
+> resource list, silently returns `[]`) nor `schedules/day` alone (it can surface
+> times on days the page marks `daysComplete`/full).
 
 ## Get notifications on your phone
 

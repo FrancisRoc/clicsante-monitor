@@ -2,17 +2,25 @@
 """
 Clic Sante availability monitor.
 
-Watches a Clic Sante clinic for new appointment slots and sends a phone push
+Watches a Clic Sante clinic for new appointment days and sends a phone push
 (via ntfy) the instant one appears.
 
-IMPORTANT - which data we read:
-  The booking page renders its calendar from the `schedules/day` API using the
-  establishment's *resolved* service ids (the "portalServicesUnified" ids in the
-  URL are aggregates that must be resolved per establishment). We replicate
-  exactly that, so we see the same slots the page shows AFTER its 2 screening
-  questions. (The screening questions are a UI/registration gate; they do not
-  change which slots exist.) We do NOT use the `/availabilities` endpoint -- that
-  one needs a resource list and silently returns [] without it.
+WHICH DATA WE READ -- we mirror the booking page exactly:
+  The page's calendar is drawn from the `schedules/public` endpoint. It returns
+  two lists per service:
+    * `availabilities` -> days that are OPEN and bookable (what the calendar
+      lets you click)
+    * `daysComplete`   -> days that exist but are FULL (greyed out)
+  We alert ONLY on `availabilities`, so "the monitor says there's a slot" means
+  "the page would let you book that day". The URL's `portalServicesUnified` ids
+  are aggregates; we resolve them to this establishment's real service ids first
+  (same as the page does). The 2 screening questions are a UI gate only -- they
+  do NOT change which days `schedules/public` returns (verified against a live
+  clinic), so we don't need them.
+
+  We deliberately do NOT use `/availabilities` (needs a resource list, silently
+  returns []) nor trust `schedules/day` alone (it can surface times on days the
+  page marks complete).
 
 Health / self-validation:
   * On any check error -> throttled "monitor error" push (silence never means
@@ -21,7 +29,7 @@ Health / self-validation:
   * Optional dead-man's switch ping (HEALTHCHECK_URL).
   * `--selftest` fires a clearly-labelled fake-slot push to validate the pipeline.
 
-State (state.json) records seen slot ids so we only alert on NEW slots.
+State (state.json) records seen (place, date) pairs so we only alert on NEW days.
 """
 import json
 import os
@@ -55,11 +63,16 @@ PLACE_NAMES = {
     "24863": "920 blv du Seminaire nord",
 }
 
-BOOKING_URL = env(
-    "CS_BOOKING_URL",
-    "https://clients3.clicsante.ca/8154/take-appt?portalPlace=23139&portalPostalCode=null"
-    "&lang=fr&portalServicesUnified=11,289,336,354&portalEst=408574&locale=fr",
-)
+
+def default_booking_url():
+    """Build the take-appt link for the watched clinic so a push always opens
+    the right page (no hard-coded mismatch when watching a different clinic)."""
+    return (f"https://clients3.clicsante.ca/{ESTABLISHMENT}/take-appt"
+            f"?portalPlace={PLACES[0] if PLACES else ''}&portalPostalCode=null"
+            f"&lang=fr&portalServicesUnified={','.join(UNIFIED_SERVICES)}&locale=fr")
+
+
+BOOKING_URL = env("CS_BOOKING_URL", default_booking_url())
 
 # ---- Notification (ntfy) ----
 NTFY_SERVER = env("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -88,9 +101,8 @@ def now_utc():
 def http_json(url, tries=4, empty_on_nothing=False):
     """GET JSON with retries.
 
-    If empty_on_nothing=True, a 404 'availabilities.public.nothing-for-day'
-    (how schedules/day signals 'no slots') is returned as an empty result,
-    not an error.
+    If empty_on_nothing=True, a 404 (how some service ids signal 'nothing here')
+    is returned as an empty result, not an error.
     """
     last = None
     for attempt in range(tries):
@@ -104,10 +116,8 @@ def http_json(url, tries=4, empty_on_nothing=False):
                 body = e.read().decode("utf-8")
             except Exception:
                 pass
-            # schedules/day signals "no slots" with a 404 (various internal codes),
-            # so for those calls any 404 means empty, not a real error.
             if empty_on_nothing and e.code == 404:
-                return {"availabilities": []}
+                return {"availabilities": [], "daysComplete": []}
             last = f"HTTP {e.code}: {body[:200]}"
         except Exception as e:  # noqa: BLE001 - transient -> retry
             last = str(e)
@@ -126,43 +136,75 @@ def resolve_service_ids():
     return sorted(ids)
 
 
-def fetch_slots():
+def _as_date(item):
+    """Normalise a schedules/public availability entry to a 'YYYY-MM-DD' string."""
+    if isinstance(item, dict):
+        for k in ("date", "day", "start", "datetime"):
+            if item.get(k):
+                return str(item[k])[:10]
+        return str(item)[:10]
+    return str(item)[:10]
+
+
+def fetch_available_days():
+    """Return {"place|date": {"place","date","services":set()}} for every day
+    the page would show as bookable (availabilities), across all places/services."""
     today = dt.date.today()
     stop = today + dt.timedelta(days=LOOKAHEAD_DAYS)
     services = resolve_service_ids()
     if not services:
         raise RuntimeError("could not resolve any service ids (site change?)")
-    slots = []
+    found = {}
     for place in PLACES:
         for svc in services:
-            url = (f"{API}/{ESTABLISHMENT}/schedules/day"
+            url = (f"{API}/{ESTABLISHMENT}/schedules/public"
                    f"?dateStart={today.isoformat()}&dateStop={stop.isoformat()}"
-                   f"&service={svc}&timezone={TIMEZONE}&places={place}&gapMode=false")
+                   f"&service={svc}&timezone={TIMEZONE}&places={place}")
             data = http_json(url, empty_on_nothing=True)
-            for s in (data.get("availabilities") or []):
-                slots.append(s)
-    return slots
+            for a in (data.get("availabilities") or []):
+                date = _as_date(a)
+                sig = f"{place}|{date}"
+                found.setdefault(sig, {"place": place, "date": date,
+                                       "services": set()})["services"].add(svc)
+    return found
 
 
-def slot_sig(slot):
-    if isinstance(slot, dict) and slot.get("id") is not None:
-        return f"id:{slot['id']}"
-    return json.dumps(slot, sort_keys=True, ensure_ascii=False)
+def fetch_times_for(place, date, service):
+    """Best-effort: list a few clock times for a newly-open day (for the push
+    body). Never raises -- enrichment only."""
+    try:
+        url = (f"{API}/{ESTABLISHMENT}/schedules/day"
+               f"?dateStart={date}&dateStop={date}&service={service}"
+               f"&timezone={TIMEZONE}&places={place}&gapMode=false")
+        data = http_json(url, empty_on_nothing=True)
+        times = sorted({(s.get("start") or "")[11:16]
+                        for s in (data.get("availabilities") or []) if s.get("start")})
+        return [t for t in times if t]
+    except Exception:
+        return []
 
 
-def fmt_slot(slot):
-    start = (slot.get("start") or "")[:16].replace("T", " ")  # "YYYY-MM-DD HH:MM"
-    place = str(slot.get("place", ""))
-    where = PLACE_NAMES.get(place, f"place {place}")
-    return f"{start}  -  {where}".strip()
+def where(place):
+    return PLACE_NAMES.get(str(place), f"place {place}")
 
 
-def human_summary(slots, limit=12):
-    lines = sorted({fmt_slot(s) for s in slots})
-    out = lines[:limit]
-    if len(lines) > limit:
-        out.append(f"... +{len(lines) - limit} more")
-    return "\n".join(out)
+def fmt_day(entry, with_times=True):
+    line = f"{entry['date']}  -  {where(entry['place'])}"
+    if with_times:
+        svc = sorted(entry["services"])[0] if entry["services"] else None
+        times = fetch_times_for(entry["place"], entry["date"], svc) if svc else []
+        if times:
+            shown = ", ".join(times[:6]) + (f" +{len(times) - 6}" if len(times) > 6 else "")
+            line += f"  ({shown})"
+    return line
+
+
+def human_summary(entries, limit=12, with_times=True):
+    entries = sorted(entries, key=lambda e: (e["date"], str(e["place"])))
+    lines = [fmt_day(e, with_times) for e in entries[:limit]]
+    if len(entries) > limit:
+        lines.append(f"... +{len(entries) - limit} more day(s)")
+    return "\n".join(lines)
 
 
 def load_state():
@@ -208,24 +250,24 @@ def ping_healthcheck(suffix=""):
 def run_check():
     print("[info]", now_utc().isoformat(), "establishment", ESTABLISHMENT,
           "places", PLACES, "unified", UNIFIED_SERVICES)
-    slots = fetch_slots()
-    now_sigs = sorted({slot_sig(s) for s in slots})
+    found = fetch_available_days()
+    now_sigs = sorted(found.keys())
 
     state = load_state()
     prev = set(state.get("signatures", []))
     new_sigs = [s for s in now_sigs if s not in prev]
-    print(f"[info] slots now: {len(slots)} | new vs last run: {len(new_sigs)}")
+    print(f"[info] open days now: {len(now_sigs)} | new vs last run: {len(new_sigs)}")
 
-    if slots and new_sigs:
-        new_slots = [s for s in slots if slot_sig(s) in set(new_sigs)]
-        title = f"Rendez-vous dispo! ({len(new_slots)})"
-        message = (f"{len(new_slots)} nouveau(x) creneau(x) a Clic Sante.\n"
-                   f"{human_summary(new_slots)}\n\nReserver ->")
+    if new_sigs:
+        new_entries = [found[s] for s in new_sigs]
+        title = f"Rendez-vous dispo! ({len(new_entries)})"
+        message = (f"{len(new_entries)} jour(s) ouvert(s) a Clic Sante.\n"
+                   f"{human_summary(new_entries)}\n\nReserver ->")
         send_push(title, message)
 
     state["signatures"] = now_sigs
-    state["count"] = len(slots)
-    if slots:
+    state["count"] = len(now_sigs)
+    if now_sigs:
         state["last_seen"] = now_utc().isoformat()
     state["last_check"] = now_utc().isoformat()
     state["last_status"] = "ok"
@@ -243,11 +285,11 @@ def main():
         return 0
 
     if "--selftest" in sys.argv:
-        sample = [{"id": "SELFTEST-1", "place": "23139", "start": "2026-06-15T09:30:00+00:00"},
-                  {"id": "SELFTEST-2", "place": "23139", "start": "2026-06-16T14:00:00+00:00"}]
+        sample = [{"place": "23139", "date": "2026-06-15", "services": set()},
+                  {"place": "23139", "date": "2026-06-16", "services": set()}]
         send_push("[TEST] Rendez-vous dispo! (2)",
                   "Ceci est un test du systeme.\n"
-                  f"{human_summary(sample)}\n\n(ignore - validation only)",
+                  f"{human_summary(sample, with_times=False)}\n\n(ignore - validation only)",
                   tags="test_tube")
         print("[selftest] sent a labelled availability push (no real slots).")
         return 0
@@ -282,7 +324,7 @@ def main():
 
     if HEARTBEAT_PUSH and state.get("heartbeat_push_date") != dt.date.today().isoformat():
         send_push("Clic Sante monitor OK",
-                  f"Still watching. {state.get('count', 0)} slot(s) right now.",
+                  f"Still watching. {state.get('count', 0)} open day(s) right now.",
                   tags="white_check_mark", priority="min")
         state["heartbeat_push_date"] = dt.date.today().isoformat()
         save_state(state)
