@@ -5,7 +5,12 @@ on:
     # Every 5 minutes (GitHub's minimum). Times are UTC. Scheduled runs can be
     # delayed a few minutes when GitHub is busy.
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # lets you run it on-demand from the Actions tab
+  workflow_dispatch:      # run on-demand from the Actions tab
+    inputs:
+      selftest:
+        description: "Send a labelled TEST availability push (validate the pipeline) instead of a real check"
+        type: boolean
+        default: false
 
 concurrency:
   group: clicsante-monitor
@@ -30,7 +35,12 @@ jobs:
           CS_PLACE: ${{ vars.CS_PLACE }}
           CS_SERVICES: ${{ vars.CS_SERVICES }}
           CS_LOOKAHEAD_DAYS: ${{ vars.CS_LOOKAHEAD_DAYS }}
-        run: python check_availability.py
+        run: |
+          if [[ "${{ inputs.selftest }}" == "true" ]]; then
+            python check_availability.py --selftest
+          else
+            python check_availability.py
+          fi
 
       - name: Persist state
         run: |
