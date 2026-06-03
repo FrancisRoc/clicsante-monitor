@@ -74,11 +74,10 @@ NTFY_TOPIC=clicsante-rdv-francis python3 check_availability.py
 
 ## Operating notes
 
-- **Cadence:** runs every **30 min** (UTC), and scheduled runs can be delayed a
-  few minutes under load. This cadence keeps a **private** repo within the free
-  2,000 Actions min/month (~1,440 min/month used). To poll faster: make the repo
-  **public** (unlimited free minutes — change cron back to `*/5`), use a paid
-  plan, or run it on an always-on machine.
+- **Cadence:** runs every **10 min** (UTC), and scheduled runs can be delayed a
+  few minutes under load. The repo is **public**, so Actions minutes are
+  unlimited and free; GitHub's minimum cron is 5 min if you want it faster.
+  Note: GitHub schedules are best-effort and can occasionally be skipped/delayed.
 - **Stays alive:** a once-a-day heartbeat in `state.json` produces a daily commit
   so GitHub doesn't auto-disable the schedule after 60 days of inactivity.
 - **Pause it:** Actions tab → *clicsante-monitor* → ••• → *Disable workflow*

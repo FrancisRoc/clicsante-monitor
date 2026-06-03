@@ -2,12 +2,10 @@ name: clicsante-monitor
 
 on:
   schedule:
-    # Every 30 minutes. Times are UTC; scheduled runs can be delayed a few
-    # minutes when GitHub is busy. Cadence chosen to stay within the free
-    # 2,000 Actions min/month on a PRIVATE repo (~1,440 min/month, with
-    # headroom for manual runs). A faster cadence needs a public repo
-    # (unlimited free minutes) or a paid plan.
-    - cron: "*/30 * * * *"
+    # Every 10 minutes. Times are UTC; scheduled runs can be delayed a few
+    # minutes when GitHub is busy. Repo is PUBLIC -> unlimited free Actions
+    # minutes, so cadence is not constrained by billing.
+    - cron: "*/10 * * * *"
   workflow_dispatch:      # run on-demand from the Actions tab
     inputs:
       selftest:
