@@ -247,16 +247,18 @@ def ping_healthcheck(suffix=""):
         print(f"[warn] healthcheck ping failed: {e}")
 
 
-def run_check():
+def do_check(state):
+    """Run one availability check against `state` (a dict), push on new open
+    days, and update `state` in place. Returns `state`. Raises on fetch error
+    (caller decides how to alert)."""
     print("[info]", now_utc().isoformat(), "establishment", ESTABLISHMENT,
           "places", PLACES, "unified", UNIFIED_SERVICES)
     found = fetch_available_days()
     now_sigs = sorted(found.keys())
 
-    state = load_state()
     prev = set(state.get("signatures", []))
     new_sigs = [s for s in now_sigs if s not in prev]
-    print(f"[info] open days now: {len(now_sigs)} | new vs last run: {len(new_sigs)}")
+    print(f"[info] open days now: {len(now_sigs)} | new vs last check: {len(new_sigs)}")
 
     if new_sigs:
         new_entries = [found[s] for s in new_sigs]
@@ -273,8 +275,62 @@ def run_check():
     state["last_status"] = "ok"
     state.pop("last_error", None)
     state["heartbeat"] = dt.date.today().isoformat()
+    return state
+
+
+def maybe_error_push(state, msg):
+    """Send a throttled 'monitor error' push and record it in `state`."""
+    last = state.get("last_error_push")
+    throttled = False
+    if last:
+        try:
+            throttled = (now_utc() - dt.datetime.fromisoformat(last)).total_seconds() \
+                < ERROR_PUSH_THROTTLE_MIN * 60
+        except ValueError:
+            throttled = False
+    if not throttled:
+        send_push("Clic Sante monitor ERROR",
+                  f"The watcher failed:\n{msg[:300]}\nIt keeps retrying; check GitHub Actions.",
+                  tags="warning", priority="default")
+        state["last_error_push"] = now_utc().isoformat()
+    state["last_check"] = now_utc().isoformat()
+    state["last_status"] = "error"
+    state["last_error"] = msg[:500]
+
+
+def run_check():
+    state = load_state()
+    try:
+        do_check(state)
+    except Exception:
+        save_state(state)
+        raise
     save_state(state)
     return state
+
+
+def run_loop(interval, max_seconds):
+    """Long-lived in-process loop: check every `interval` s for up to
+    `max_seconds`, keeping dedup state in memory (no duplicate pings) and never
+    dying on a transient error. State is persisted each iteration so the next
+    job (and a final git commit) can resume. Designed to be re-launched before
+    the GitHub 6h job limit, so it doesn't rely on GitHub's flaky scheduler."""
+    deadline = time.time() + max_seconds
+    state = load_state()
+    n = 0
+    while True:
+        n += 1
+        try:
+            do_check(state)
+        except Exception as e:  # noqa: BLE001 - keep looping on transient errors
+            print(f"[error] check #{n} failed: {e}", file=sys.stderr)
+            maybe_error_push(state, str(e))
+        save_state(state)
+        ping_healthcheck()
+        if time.time() + interval >= deadline:
+            print(f"[loop] reached time budget after {n} checks; exiting to relaunch.")
+            return 0
+        time.sleep(interval)
 
 
 def main():
@@ -294,28 +350,21 @@ def main():
         print("[selftest] sent a labelled availability push (no real slots).")
         return 0
 
+    # Long-lived loop mode: `--loop [interval_seconds] [max_seconds]`.
+    if "--loop" in sys.argv:
+        i = sys.argv.index("--loop")
+        rest = [a for a in sys.argv[i + 1:] if not a.startswith("-")]
+        interval = int(rest[0]) if len(rest) > 0 else int(env("CS_LOOP_INTERVAL", "600"))
+        max_seconds = int(rest[1]) if len(rest) > 1 else int(env("CS_LOOP_MAX_SECONDS", "19200"))  # 5h20m
+        print(f"[loop] starting: every {interval}s for up to {max_seconds}s")
+        return run_loop(interval, max_seconds)
+
     try:
         state = run_check()
     except Exception as e:  # noqa: BLE001 - alert on watcher failure, then fail loud
-        msg = str(e)
-        print(f"[error] check failed: {msg}", file=sys.stderr)
+        print(f"[error] check failed: {e}", file=sys.stderr)
         st = load_state()
-        last = st.get("last_error_push")
-        throttled = False
-        if last:
-            try:
-                throttled = (now_utc() - dt.datetime.fromisoformat(last)).total_seconds() \
-                    < ERROR_PUSH_THROTTLE_MIN * 60
-            except ValueError:
-                throttled = False
-        if not throttled:
-            send_push("Clic Sante monitor ERROR",
-                      f"The watcher failed:\n{msg[:300]}\nIt keeps retrying; check GitHub Actions.",
-                      tags="warning", priority="default")
-            st["last_error_push"] = now_utc().isoformat()
-        st["last_check"] = now_utc().isoformat()
-        st["last_status"] = "error"
-        st["last_error"] = msg[:500]
+        maybe_error_push(st, str(e))
         save_state(st)
         ping_healthcheck("/fail")
         raise

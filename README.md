@@ -4,8 +4,12 @@ Watches a specific [Clic Santé](https://clicsante.ca) booking page for new
 appointment availabilities and sends an instant **phone push** (via
 [ntfy](https://ntfy.sh)) the moment a slot opens up.
 
-Runs **24/7 in the cloud** via GitHub Actions (every ~5 minutes), so it keeps
-working even when your computer is asleep, closed, or off.
+Runs **24/7 in the cloud** via GitHub Actions, so it keeps working even when
+your computer is asleep, closed, or off. It does **not** rely on GitHub's
+(unreliable) `schedule` cron: a long-lived job loops in-process every ~10 min
+and relaunches itself before the 6 h job limit, so one monitor runs
+continuously. A sparse hourly cron is only a watchdog that restarts the loop if
+that chain ever breaks.
 
 ## What it watches
 
@@ -74,10 +78,13 @@ NTFY_TOPIC=clicsante-rdv-francis python3 check_availability.py
 
 ## Operating notes
 
-- **Cadence:** runs every **10 min** (UTC), and scheduled runs can be delayed a
-  few minutes under load. The repo is **public**, so Actions minutes are
-  unlimited and free; GitHub's minimum cron is 5 min if you want it faster.
-  Note: GitHub schedules are best-effort and can occasionally be skipped/delayed.
+- **Cadence:** the in-process loop checks every **10 min** (set `CS_LOOP_INTERVAL`
+  in seconds to change it). This is independent of GitHub's flaky scheduler. The
+  repo is **public**, so Actions minutes are unlimited and free.
+- **Reliability:** the loop relaunches itself (`gh workflow run`) before the 6 h
+  job cap; the hourly `schedule` cron is only a watchdog that starts a loop if
+  none is running. If everything ever stops, run the workflow once manually
+  (Actions tab -> Run workflow) to re-seed the chain.
 - **Stays alive:** a once-a-day heartbeat in `state.json` produces a daily commit
   so GitHub doesn't auto-disable the schedule after 60 days of inactivity.
 - **Pause it:** Actions tab → *clicsante-monitor* → ••• → *Disable workflow*

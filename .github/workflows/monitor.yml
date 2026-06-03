@@ -1,59 +1,108 @@
 name: clicsante-monitor
 
+# Reliability model (GitHub's `schedule` cron is best-effort and often skipped):
+#   * The real work is a LONG-LIVED job that loops in-process (check -> sleep
+#     ~10 min -> repeat) for ~5h20m, then RELAUNCHES ITSELF before GitHub's 6h
+#     job limit. This keeps exactly one monitor running continuously without
+#     depending on the scheduler.
+#   * A sparse `schedule` cron is only a WATCHDOG: if the self-relaunch chain
+#     ever breaks (runner died), it notices no loop is running and starts one.
+# Public repo => unlimited free Actions minutes, so a continuous job is free.
+
 on:
-  schedule:
-    # Every 10 minutes. Times are UTC; scheduled runs can be delayed a few
-    # minutes when GitHub is busy. Repo is PUBLIC -> unlimited free Actions
-    # minutes, so cadence is not constrained by billing.
-    - cron: "*/10 * * * *"
-  workflow_dispatch:      # run on-demand from the Actions tab
+  workflow_dispatch:
     inputs:
       selftest:
-        description: "Send a labelled TEST availability push (validate the pipeline) instead of a real check"
+        description: "Send a labelled TEST availability push (validate the pipeline) instead of looping"
         type: boolean
         default: false
-
-concurrency:
-  group: clicsante-monitor
-  cancel-in-progress: false
+  schedule:
+    - cron: "37 * * * *"   # watchdog: ~hourly, only restarts a dead loop
 
 permissions:
-  contents: write   # needed to commit the state file back to the repo
+  contents: write   # commit state.json
+  actions: write    # relaunch / dispatch the workflow
 
 jobs:
-  check:
+  # --- One-off labelled test push (own concurrency group: never disturbs loop) ---
+  selftest:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.selftest }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: clicsante-selftest-${{ github.run_id }}
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5   # runs on Node 24; ubuntu-latest already has python3
-
-      - name: Check availability and notify
+      - uses: actions/checkout@v5
+      - name: Send test push
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_SERVER: ${{ vars.NTFY_SERVER }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-          # Optional health/observability (off unless you set them):
-          HEARTBEAT_PUSH: ${{ vars.HEARTBEAT_PUSH }}     # set repo variable to 1 for a daily "still alive" push
-          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }} # e.g. a healthchecks.io ping URL (dead-man's switch)
-          # Optional overrides (otherwise the defaults baked into the script are used):
+        run: python check_availability.py --selftest
+
+  # --- The continuous monitor: in-process loop + self-relaunch ---
+  loop:
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.selftest }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350     # under GitHub's 360-min hard cap
+    concurrency:
+      group: clicsante-loop  # exactly one loop at a time; successors queue, not pile
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Watch availability (in-process loop)
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ vars.NTFY_SERVER }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          HEARTBEAT_PUSH: ${{ vars.HEARTBEAT_PUSH }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           CS_ESTABLISHMENT: ${{ vars.CS_ESTABLISHMENT }}
           CS_PLACE: ${{ vars.CS_PLACE }}
+          CS_PLACES: ${{ vars.CS_PLACES }}
           CS_SERVICES: ${{ vars.CS_SERVICES }}
           CS_LOOKAHEAD_DAYS: ${{ vars.CS_LOOKAHEAD_DAYS }}
-        run: |
-          if [[ "${{ inputs.selftest }}" == "true" ]]; then
-            python check_availability.py --selftest
-          else
-            python check_availability.py
-          fi
+          CS_LOOP_INTERVAL: ${{ vars.CS_LOOP_INTERVAL }}
+        run: python check_availability.py --loop "${CS_LOOP_INTERVAL:-600}" 19200
 
       - name: Persist state
+        if: always()
         run: |
           if [[ -n "$(git status --porcelain state.json)" ]]; then
             git config user.name "clicsante-bot"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add state.json
-            git commit -m "state update [skip ci]"
-            git push
+            git commit -m "state update [skip ci]" || true
+            git pull --rebase --autostash || true
+            git push || true
+          fi
+
+      - name: Relaunch the loop (chain continues only on clean exit)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml --ref main
+
+  # --- Watchdog: only restarts the loop if none is running ---
+  watchdog:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: clicsante-watchdog
+      cancel-in-progress: true
+    steps:
+      - name: Start a loop if none is running
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          active=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow monitor.yml \
+                    --event workflow_dispatch --status in_progress \
+                    --json databaseId --jq 'length')
+          echo "in-progress dispatch (loop) runs: ${active:-0}"
+          if [ "${active:-0}" -eq 0 ]; then
+            echo "No loop running -> starting one."
+            gh workflow run monitor.yml --ref main
           else
-            echo "no state change"
+            echo "Loop already running -> nothing to do."
           fi
