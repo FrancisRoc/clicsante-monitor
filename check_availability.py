@@ -37,6 +37,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import datetime as dt
 
 
@@ -47,26 +48,51 @@ def env(name, default=""):
     return value if value not in (None, "") else default
 
 
-# ---- What to watch (from the booking URL) ----
 API = "https://api3.clicsante.ca/v3/establishments"
-ESTABLISHMENT = env("CS_ESTABLISHMENT", "8154")
-PLACES = [p.strip() for p in env("CS_PLACES", env("CS_PLACE", "23139")).split(",") if p.strip()]
-UNIFIED_SERVICES = [s.strip() for s in env("CS_SERVICES", "11,289,336,354").split(",") if s.strip()]
+
+
+def parse_clicsante_url(url):
+    """Extract {establishment, places, services} from any Clic Sante booking
+    link, e.g. https://clients3.clicsante.ca/65760/take-appt?portalPlace=25141
+    &portalServicesUnified=11,289,336,354&portalEst=466471 -> establishment is
+    the numeric path segment, places from portalPlace, services from
+    portalServicesUnified."""
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    segments = [s for s in parsed.path.split("/") if s]
+    establishment = next((s for s in segments if s.isdigit()), "")
+    places = []
+    for key in ("portalPlace", "places", "place"):
+        for value in query.get(key, []):
+            places += [x.strip() for x in value.split(",") if x.strip().isdigit()]
+    services = []
+    for key in ("portalServicesUnified", "services"):
+        for value in query.get(key, []):
+            services += [x.strip() for x in value.split(",") if x.strip()]
+    return {"establishment": establishment,
+            "places": list(dict.fromkeys(places)),
+            "services": list(dict.fromkeys(services))}
+
+
+# ---- What to watch: paste one CS_URL, or set CS_ESTABLISHMENT/CS_PLACE/CS_SERVICES ----
+CS_URL = env("CS_URL", "")
+_from_url = parse_clicsante_url(CS_URL) if CS_URL else {"establishment": "", "places": [], "services": []}
+
+ESTABLISHMENT = _from_url["establishment"] or env("CS_ESTABLISHMENT", "8154")
+PLACES = _from_url["places"] or [p.strip() for p in env("CS_PLACES", env("CS_PLACE", "23139")).split(",") if p.strip()]
+UNIFIED_SERVICES = _from_url["services"] or [s.strip() for s in env("CS_SERVICES", "11,289,336,354").split(",") if s.strip()]
 TIMEZONE = env("CS_TIMEZONE", "America/Toronto")
 LOOKAHEAD_DAYS = int(env("CS_LOOKAHEAD_DAYS", "90"))
 
-# Friendly names for this establishment's places (for nicer notifications).
-PLACE_NAMES = {
-    "23139": "920 Bd du Seminaire N", "23140": "3120 boul. Taschereau",
-    "23141": "1333 Boul. Jacques-Cartier E", "23142": "150 Rue Saint-Thomas",
-    "23143": "2750 Boul. Laframboise, St-Hyacinthe", "23144": "200 Bd Brisebois",
-    "24863": "920 blv du Seminaire nord",
-}
+# Place names are fetched per-establishment at runtime (works for any clinic).
+PLACE_NAMES = {}
 
 
 def default_booking_url():
-    """Build the take-appt link for the watched clinic so a push always opens
-    the right page (no hard-coded mismatch when watching a different clinic)."""
+    """The link a push opens. Prefer the exact pasted CS_URL; otherwise build a
+    take-appt link for the watched clinic so it always opens the right page."""
+    if CS_URL:
+        return CS_URL
     return (f"https://clients3.clicsante.ca/{ESTABLISHMENT}/take-appt"
             f"?portalPlace={PLACES[0] if PLACES else ''}&portalPostalCode=null"
             f"&lang=fr&portalServicesUnified={','.join(UNIFIED_SERVICES)}&locale=fr")
@@ -126,14 +152,44 @@ def http_json(url, tries=4, empty_on_nothing=False):
 
 
 def resolve_service_ids():
-    """Resolve the unified service ids in the URL to this establishment's real
-    service ids (what the schedule endpoints require)."""
+    """Resolve which real service ids to watch. If the link gave unified service
+    ids, resolve those to this establishment's real ids. If it gave none (some
+    links omit them), fall back to ALL of the establishment's services."""
     ids = set()
     for u in UNIFIED_SERVICES:
         data = http_json(f"{API}/{ESTABLISHMENT}/unified/{u}/service")
         if isinstance(data, list):
             ids.update(str(x) for x in data)
+    if not ids:
+        data = http_json(f"{API}/{ESTABLISHMENT}/services")
+        if isinstance(data, list):
+            ids.update(str(s.get("id")) for s in data if s.get("id") is not None)
     return sorted(ids)
+
+
+def load_place_names():
+    """Populate PLACE_NAMES for the watched establishment (any clinic) so
+    notifications show real place names instead of bare ids. Best-effort."""
+    if PLACE_NAMES:
+        return
+    try:
+        data = http_json(f"{API}/{ESTABLISHMENT}/places")
+        for pl in (data or []):
+            pid = str(pl.get("id"))
+            name = (pl.get("name_fr") or pl.get("name_en") or "").strip()
+            PLACE_NAMES[pid] = name or f"place {pid}"
+    except Exception as e:  # noqa: BLE001 - cosmetic only
+        print(f"[warn] could not load place names: {e}")
+
+
+def establishment_name():
+    try:
+        data = http_json(f"{API}/{ESTABLISHMENT}")
+        if isinstance(data, dict):
+            return data.get("name") or f"establishment {ESTABLISHMENT}"
+    except Exception:  # noqa: BLE001
+        pass
+    return f"establishment {ESTABLISHMENT}"
 
 
 def _as_date(item):
@@ -253,6 +309,7 @@ def do_check(state):
     (caller decides how to alert)."""
     print("[info]", now_utc().isoformat(), "establishment", ESTABLISHMENT,
           "places", PLACES, "unified", UNIFIED_SERVICES)
+    load_place_names()
     found = fetch_available_days()
     now_sigs = sorted(found.keys())
 
@@ -333,7 +390,32 @@ def run_loop(interval, max_seconds):
         time.sleep(interval)
 
 
+def describe(send=True):
+    """Validate the configured link and report (and optionally push) exactly
+    what will be watched + current availability. Great first-run confirmation."""
+    load_place_names()
+    name = establishment_name()
+    services = resolve_service_ids()
+    found = fetch_available_days()
+    place_list = ", ".join(where(p) for p in PLACES) or "(none)"
+    summary = (f"Now watching: {name}\n"
+               f"Place(s): {place_list}\n"
+               f"Services watched: {len(services)} | Open days right now: {len(found)}")
+    print("[setup]\n" + summary)
+    if found:
+        print(human_summary([found[k] for k in sorted(found)], with_times=False))
+    if send:
+        send_push(f"Clic Sante: now watching {name}".strip(),
+                  summary + "\n\nSetup OK - you'll get a push when a new day opens.",
+                  tags="white_check_mark", priority="default")
+    return summary
+
+
 def main():
+    if "--describe" in sys.argv or "--setup" in sys.argv:
+        describe(send=True)
+        return 0
+
     if "--test-push" in sys.argv:
         send_push("Clic Sante monitor: test",
                   "If you can read this on your phone, notifications work.",

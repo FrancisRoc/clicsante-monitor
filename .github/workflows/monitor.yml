@@ -12,6 +12,10 @@ name: clicsante-monitor
 on:
   workflow_dispatch:
     inputs:
+      setup:
+        description: "Setup check: validate your CS_URL and push a confirmation of what will be watched"
+        type: boolean
+        default: false
       selftest:
         description: "Send a labelled TEST availability push (validate the pipeline) instead of looping"
         type: boolean
@@ -24,9 +28,30 @@ permissions:
   actions: write    # relaunch / dispatch the workflow
 
 jobs:
+  # --- Setup check: validate the user's link, push what will be watched ---
+  setup:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.setup }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: clicsante-setup-${{ github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate link and confirm
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ vars.NTFY_SERVER }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          CS_URL: ${{ vars.CS_URL }}
+          CS_ESTABLISHMENT: ${{ vars.CS_ESTABLISHMENT }}
+          CS_PLACE: ${{ vars.CS_PLACE }}
+          CS_PLACES: ${{ vars.CS_PLACES }}
+          CS_SERVICES: ${{ vars.CS_SERVICES }}
+        run: python check_availability.py --setup
+
   # --- One-off labelled test push (own concurrency group: never disturbs loop) ---
   selftest:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.selftest }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.selftest && !inputs.setup }}
     runs-on: ubuntu-latest
     concurrency:
       group: clicsante-selftest-${{ github.run_id }}
@@ -42,7 +67,7 @@ jobs:
 
   # --- The continuous monitor: in-process loop + self-relaunch ---
   loop:
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.selftest }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.selftest && !inputs.setup }}
     runs-on: ubuntu-latest
     timeout-minutes: 350     # under GitHub's 360-min hard cap
     concurrency:
@@ -58,6 +83,7 @@ jobs:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           HEARTBEAT_PUSH: ${{ vars.HEARTBEAT_PUSH }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          CS_URL: ${{ vars.CS_URL }}
           CS_ESTABLISHMENT: ${{ vars.CS_ESTABLISHMENT }}
           CS_PLACE: ${{ vars.CS_PLACE }}
           CS_PLACES: ${{ vars.CS_PLACES }}
