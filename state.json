@@ -2,7 +2,8 @@
   "signatures": [],
   "count": 0,
   "last_seen": "2026-06-04T13:15:06.833648+00:00",
-  "last_check": "2026-06-05T08:27:54.041275+00:00",
+  "last_check": "2026-06-05T13:46:45.602276+00:00",
   "heartbeat": "2026-06-05",
-  "last_status": "ok"
+  "last_status": "ok",
+  "last_error_push": "2026-06-05T12:43:32.941604+00:00"
 }
